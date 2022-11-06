@@ -1,0 +1,12 @@
+diff --git a/Makefile b/Makefile
+index 9e12c14ea..b5b2fa092 100644
+--- a/Makefile
++++ b/Makefile
+@@ -897,6 +897,7 @@ ifdef CONFIG_LTO_CLANG
+ ifdef CONFIG_LTO_CLANG_THIN
+ CC_FLAGS_LTO	:= -flto=thin -fsplit-lto-unit
+ KBUILD_LDFLAGS	+= --thinlto-cache-dir=$(extmod_prefix).thinlto-cache
++KBUILD_LDFLAGS  += -mllvm -x86-bti-gadget-finder -mllvm -stats -mllvm -x86-bti-symbols
+ else
+ CC_FLAGS_LTO	:= -flto
+ endif

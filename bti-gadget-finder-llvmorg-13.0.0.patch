@@ -1,0 +1,1222 @@
+diff --git a/llvm/lib/CodeGen/RDFGraph.cpp b/llvm/lib/CodeGen/RDFGraph.cpp
+index f605068e076d..8945faa8ca60 100644
+--- a/llvm/lib/CodeGen/RDFGraph.cpp
++++ b/llvm/lib/CodeGen/RDFGraph.cpp
+@@ -896,21 +896,14 @@ void DataFlowGraph::build(unsigned Options) {
+   MachineRegisterInfo &MRI = MF.getRegInfo();
+   MachineBasicBlock &EntryB = *EA.Addr->getCode();
+   assert(EntryB.pred_empty() && "Function entry block has predecessors");
+-  for (std::pair<unsigned,unsigned> P : MRI.liveins())
+-    LiveIns.insert(RegisterRef(P.first));
+   if (MRI.tracksLiveness()) {
+-    for (auto I : EntryB.liveins())
+-      LiveIns.insert(RegisterRef(I.PhysReg, I.LaneMask));
+-  }
+-
+-  // Add function-entry phi nodes for the live-in registers.
+-  //for (std::pair<RegisterId,LaneBitmask> P : LiveIns) {
+-  for (auto I = LiveIns.rr_begin(), E = LiveIns.rr_end(); I != E; ++I) {
+-    RegisterRef RR = *I;
+-    NodeAddr<PhiNode*> PA = newPhi(EA);
+-    uint16_t PhiFlags = NodeAttrs::PhiRef | NodeAttrs::Preserving;
+-    NodeAddr<DefNode*> DA = newDef(PA, RR, PhiFlags);
+-    PA.Addr->addMember(DA, *this);
++    for (auto I = MRI.livein_begin(), E = MRI.livein_end(); I != E; ++I) {
++      RegisterRef RR(I->first);
++      NodeAddr<PhiNode*> PA = newPhi(EA);
++      uint16_t PhiFlags = NodeAttrs::PhiRef | NodeAttrs::Preserving;
++      NodeAddr<DefNode*> DA = newDef(PA, RR, PhiFlags);
++      PA.Addr->addMember(DA, *this);
++    }
+   }
+ 
+   // Add phis for landing pads.
+diff --git a/llvm/lib/Target/X86/CMakeLists.txt b/llvm/lib/Target/X86/CMakeLists.txt
+index a2816f6e5e84..2cd6efd84599 100644
+--- a/llvm/lib/Target/X86/CMakeLists.txt
++++ b/llvm/lib/Target/X86/CMakeLists.txt
+@@ -26,6 +26,7 @@ add_public_tablegen_target(X86CommonTableGen)
+ set(sources
+   X86AsmPrinter.cpp
+   X86AvoidTrailingCall.cpp
++  X86BranchTargetInjectionGadgetFinder.cpp
+   X86CallFrameOptimization.cpp
+   X86CallingConv.cpp
+   X86CallLowering.cpp
+diff --git a/llvm/lib/Target/X86/X86.h b/llvm/lib/Target/X86/X86.h
+index eba5b6ce7836..672054cbddad 100644
+--- a/llvm/lib/Target/X86/X86.h
++++ b/llvm/lib/Target/X86/X86.h
+@@ -149,6 +149,7 @@ InstructionSelector *createX86InstructionSelector(const X86TargetMachine &TM,
+                                                   X86Subtarget &,
+                                                   X86RegisterBankInfo &);
+ 
++FunctionPass *createX86BranchTargetInjectionGadgetFinderPass();
+ FunctionPass *createX86LoadValueInjectionLoadHardeningPass();
+ FunctionPass *createX86LoadValueInjectionRetHardeningPass();
+ FunctionPass *createX86SpeculativeLoadHardeningPass();
+@@ -161,6 +162,7 @@ void initializeFPSPass(PassRegistry &);
+ void initializeWinEHStatePassPass(PassRegistry &);
+ void initializeX86AvoidSFBPassPass(PassRegistry &);
+ void initializeX86AvoidTrailingCallPassPass(PassRegistry &);
++void initializeX86BranchTargetInjectionGadgetFinderPassPass(PassRegistry &);
+ void initializeX86CallFrameOptimizationPass(PassRegistry &);
+ void initializeX86CmovConverterPassPass(PassRegistry &);
+ void initializeX86DomainReassignmentPass(PassRegistry &);
+diff --git a/llvm/lib/Target/X86/X86BranchTargetInjectionGadgetFinder.cpp b/llvm/lib/Target/X86/X86BranchTargetInjectionGadgetFinder.cpp
+new file mode 100644
+index 000000000000..13aa59c6b67f
+--- /dev/null
++++ b/llvm/lib/Target/X86/X86BranchTargetInjectionGadgetFinder.cpp
+@@ -0,0 +1,1047 @@
++//==-- X86BranchTargetInjectionGadgetFinder.cpp - BTI gadget finding --------=//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++///
++/// Description: This pass finds Branch Target Injection (BTI) gadgets
++/// consisting of a load, then a left shift by >= 6 bits, and finally a transmit
++/// instruction. The pass looks for gadgets that use a live register
++/// at an indirect call target. The pass can also be extended to scan for
++/// gadgets at other indirect branch targets.
++///
++/// This pass does have some known issues and potential enhancements that are
++/// indicated with FIXME's.
++///
++//===----------------------------------------------------------------------===//
++
++#include "ImmutableGraph.h"
++#include "MCTargetDesc/X86MCTargetDesc.h"
++#include "X86.h"
++#include "X86Subtarget.h"
++#include "X86TargetMachine.h"
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/DenseSet.h"
++#include "llvm/ADT/STLExtras.h"
++#include "llvm/ADT/SmallSet.h"
++#include "llvm/ADT/Statistic.h"
++#include "llvm/ADT/StringRef.h"
++#include "llvm/CodeGen/MachineBasicBlock.h"
++#include "llvm/CodeGen/MachineDominanceFrontier.h"
++#include "llvm/CodeGen/MachineDominators.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/MachineFunctionPass.h"
++#include "llvm/CodeGen/MachineInstr.h"
++#include "llvm/CodeGen/MachineInstrBuilder.h"
++#include "llvm/CodeGen/MachineJumpTableInfo.h"
++#include "llvm/CodeGen/MachineLoopInfo.h"
++#include "llvm/CodeGen/MachineRegisterInfo.h"
++#include "llvm/CodeGen/RDFGraph.h"
++#include "llvm/CodeGen/RDFLiveness.h"
++#include "llvm/InitializePasses.h"
++#include "llvm/MC/MCContext.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/DOTGraphTraits.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/DynamicLibrary.h"
++#include "llvm/Support/GraphWriter.h"
++#include "llvm/Support/raw_ostream.h"
++
++using namespace llvm;
++
++#define PASS_KEY "x86-bti"
++#define DEBUG_TYPE PASS_KEY
++
++STATISTIC(NumIndirectCallTargetsAnalyzed,
++          "Number of indirect call targets analyzed");
++STATISTIC(NumIndirectCallTargetsWithGadgets,
++          "Number of indirect call targets with gadgets");
++STATISTIC(NumIndirectCallTargetGadgets,
++          "Number of BTI gadgets detected at indirect call targets");
++STATISTIC(NumIndirectJumpTargetsAnalyzed,
++          "Number of indirect jump targets analyzed");
++STATISTIC(NumIndirectJumpTargetsWithGadgets,
++          "Number of indirect jump targets with gadgets");
++STATISTIC(NumIndirectJumpTargetGadgets,
++          "Number of BTI gadgets detected at indirect jump targets");
++STATISTIC(NumReturnTargetsAnalyzed, "Number of return targets analyzed");
++STATISTIC(NumReturnTargetsWithGadgets, "Number of return targets with gadgets");
++STATISTIC(NumReturnTargetGadgets,
++          "Number of BTI gadgets detected at return targets");
++STATISTIC(NumLabels, "Number of labels inserted into the binary");
++
++static cl::opt<bool> EnableBranchTargetInjectionGadgetFinder(
++    "x86-bti-gadget-finder",
++    cl::desc("Enable scanning for BTI disclosure gadgets"), cl::init(false),
++    cl::Hidden);
++
++static cl::opt<std::string> OptGadgetType(
++    PASS_KEY "-gadget-type",
++    cl::desc(
++        "The type of disclosure gadget for which to scan [default=masked]:\n"
++        "masked   Only gadgets where the access is zero/sign extended\n"
++        "linear   Only masked gadgets that do not cross a call or Jcc\n"
++        "all      All reachable gadgets that load and transmit a value\n"),
++    cl::init("linear"), cl::Hidden);
++
++static cl::opt<std::string> OptBranchTargetType(
++    PASS_KEY "-target",
++    cl::desc(
++        "Specify types of indirect branch targets to analyze [default=call]:\n"
++        "call     indicates indirect call targets\n"
++        "jmp      indicates indirect jump targets\n"
++        "ret      indicates return targets\n"
++        "all      indicates all indirect branch targets"),
++    cl::init("call"), cl::Hidden);
++
++static cl::opt<bool>
++    EmitSymbols(PASS_KEY "-symbols",
++                cl::desc("Emit gadget component symbols into the binary"),
++                cl::init(false), cl::Hidden);
++
++static cl::opt<bool> EmitDot(
++    PASS_KEY "-dot",
++    cl::desc(
++        "For each function, emit a dot graph depicting potential BTI gadgets"),
++    cl::init(false), cl::Hidden);
++
++namespace {
++
++struct MachineGadgetGraph : ImmutableGraph<MachineInstr *, int> {
++  static constexpr MachineInstr *const ArgNodeSentinel = nullptr;
++
++  enum GadgetEdgeType {
++    ByteLoad,
++    WordLoad,
++    Shl,
++    Transmit,
++  };
++  static const char *GadgetEdgeString[];
++
++  using GraphT = ImmutableGraph<MachineInstr *, int>;
++  using Node = typename GraphT::Node;
++  using Edge = typename GraphT::Edge;
++  using size_type = typename GraphT::size_type;
++  MachineGadgetGraph(std::unique_ptr<Node[]> Nodes,
++                     std::unique_ptr<Edge[]> Edges, size_type NodesSize,
++                     size_type EdgesSize, int NumFences = 0, int NumGadgets = 0)
++      : GraphT(std::move(Nodes), std::move(Edges), NodesSize, EdgesSize),
++        NumFences(NumFences), NumGadgets(NumGadgets) {}
++  static inline bool isCFGEdge(const Edge &E) { return E.getValue() >= 0; }
++  static inline bool isGadgetEdge(const Edge &E) { return E.getValue() < 0; }
++  int NumFences;
++  int NumGadgets;
++};
++
++const char *MachineGadgetGraph::GadgetEdgeString[] = {"ByteLoad", "WordLoad",
++                                                      "Shift", "Transmit"};
++
++class X86BranchTargetInjectionGadgetFinderPass : public MachineFunctionPass {
++public:
++  X86BranchTargetInjectionGadgetFinderPass() : MachineFunctionPass(ID) {
++    if (OptBranchTargetType == "call")
++      BranchTargetType = Call;
++    else if (OptBranchTargetType == "jmp")
++      BranchTargetType = Jump;
++    else if (OptBranchTargetType == "ret")
++      BranchTargetType = Ret;
++    else if (OptBranchTargetType == "all")
++      BranchTargetType = Call | Jump | Ret;
++    else {
++      errs() << "Invalid option for indirect target branch type: \""
++             << OptBranchTargetType << "\", assuming \"call\"";
++      BranchTargetType = Call;
++    }
++
++    if (OptGadgetType == "all")
++      GadgetType = AllGadgets;
++    else if (OptGadgetType == "masked")
++      GadgetType = MaskedGadgets;
++    else if (OptGadgetType == "linear")
++      GadgetType = LinearGadgets;
++    else {
++      errs() << "Invalid option for gadget type: \"" << OptGadgetType
++             << "\", assuming \"masked\"";
++      GadgetType = MaskedGadgets;
++    }
++  }
++
++  StringRef getPassName() const override {
++    return "X86 Branch Target Injection (BTI) gadget finding";
++  }
++  void getAnalysisUsage(AnalysisUsage &AU) const override;
++  bool runOnMachineFunction(MachineFunction &MF) override;
++
++  static char ID;
++
++private:
++  using GraphBuilder = ImmutableGraphBuilder<MachineGadgetGraph>;
++  using GraphIter = typename GraphBuilder::BuilderNodeRef;
++  using Edge = MachineGadgetGraph::Edge;
++  using Node = MachineGadgetGraph::Node;
++  using EdgeSet = MachineGadgetGraph::EdgeSet;
++  using NodeSet = MachineGadgetGraph::NodeSet;
++
++  struct GraphBuilderContext {
++    MachineFunction *MF;
++    GraphBuilder Builder;
++    DenseMap<MachineInstr *, GraphIter> NodeMap;
++    DenseSet<std::pair<std::pair<GraphIter, GraphIter>, int>>
++        GadgetComponentSet;
++    rdf::DataFlowGraph *DFG;
++    rdf::Liveness *L;
++  };
++
++  const X86Subtarget *STI;
++  const TargetInstrInfo *TII;
++  const TargetRegisterInfo *TRI;
++  SmallSet<const MachineInstr *, 4> CallGadgetLoads;
++  SmallSet<const MachineInstr *, 4> JumpGadgetLoads;
++  SmallSet<const MachineInstr *, 4> RetGadgetLoads;
++  enum {
++    Call = 0x01,
++    Jump = 0x02,
++    Ret = 0x04,
++  };
++  unsigned BranchTargetType;
++  enum {
++    AllGadgets,
++    MaskedGadgets,
++    LinearGadgets,
++  } GadgetType;
++
++  bool gadgetIsLinear(const rdf::DataFlowGraph &DFG,
++                      const SmallVector<rdf::NodeAddr<rdf::InstrNode *>, 4>
++                          &GadgetComponents) const;
++  std::unique_ptr<MachineGadgetGraph>
++  getGadgetGraph(MachineFunction &MF, const MachineLoopInfo &MLI,
++                 const MachineDominatorTree &MDT,
++                 const MachineDominanceFrontier &MDF);
++  bool analyzeDefs(GraphBuilderContext &Ctx,
++                   const SmallVector<rdf::NodeAddr<rdf::DefNode *>, 4> &Defs,
++                   const Twine &Label, unsigned TargetType);
++  bool instrUsesRegToAccessMemory(const MachineInstr &I, unsigned Reg) const;
++  inline bool isFence(const MachineInstr *MI) const {
++    return MI && (MI->getOpcode() == X86::LFENCE);
++  }
++};
++
++} // end anonymous namespace
++
++namespace llvm {
++
++template <>
++struct GraphTraits<MachineGadgetGraph *>
++    : GraphTraits<ImmutableGraph<MachineInstr *, int> *> {};
++
++template <>
++struct DOTGraphTraits<MachineGadgetGraph *> : DefaultDOTGraphTraits {
++  using GraphType = MachineGadgetGraph;
++  using Traits = llvm::GraphTraits<GraphType *>;
++  using NodeRef = typename Traits::NodeRef;
++  using EdgeRef = typename Traits::EdgeRef;
++  using ChildIteratorType = typename Traits::ChildIteratorType;
++  using ChildEdgeIteratorType = typename Traits::ChildEdgeIteratorType;
++
++  DOTGraphTraits(bool IsSimple = false) : DefaultDOTGraphTraits(IsSimple) {}
++
++  std::string getNodeLabel(NodeRef Node, GraphType *) {
++    if (Node->getValue() == MachineGadgetGraph::ArgNodeSentinel)
++      return "ARGS";
++
++    std::string Str;
++    raw_string_ostream OS(Str);
++    OS << *Node->getValue();
++    return OS.str();
++  }
++
++  static std::string getNodeAttributes(NodeRef Node, GraphType *) {
++    MachineInstr *MI = Node->getValue();
++    if (MI == MachineGadgetGraph::ArgNodeSentinel)
++      return "color = blue";
++    if (MI->getOpcode() == X86::LFENCE)
++      return "color = green";
++    return "";
++  }
++
++  static std::string getEdgeAttributes(NodeRef, ChildIteratorType E,
++                                       GraphType *) {
++    int EdgeVal = (*E.getCurrent()).getValue();
++    if (EdgeVal >= 0)
++      return "label = " + std::to_string(EdgeVal);
++    return "color = red, style = \"dashed\", fontcolor = red, label = \"" +
++           std::string(MachineGadgetGraph::GadgetEdgeString[-EdgeVal - 1]) +
++           "\"";
++  }
++};
++
++} // end namespace llvm
++
++constexpr MachineInstr *MachineGadgetGraph::ArgNodeSentinel;
++
++char X86BranchTargetInjectionGadgetFinderPass::ID = 0;
++
++void X86BranchTargetInjectionGadgetFinderPass::getAnalysisUsage(
++    AnalysisUsage &AU) const {
++  MachineFunctionPass::getAnalysisUsage(AU);
++  AU.addRequired<MachineLoopInfo>();
++  AU.addRequired<MachineDominatorTree>();
++  AU.addRequired<MachineDominanceFrontier>();
++  AU.setPreservesCFG();
++}
++
++static void writeGadgetGraph(raw_ostream &OS, MachineFunction &MF,
++                             MachineGadgetGraph *G) {
++  WriteGraph(OS, G, /*ShortNames*/ false,
++             "Disclosure gadgets for the \"" + MF.getName() + "\" function");
++}
++
++bool X86BranchTargetInjectionGadgetFinderPass::runOnMachineFunction(
++    MachineFunction &MF) {
++  LLVM_DEBUG(dbgs() << "***** " << getPassName() << " : " << MF.getName()
++                    << " *****\n");
++  STI = &MF.getSubtarget<X86Subtarget>();
++  if (!EnableBranchTargetInjectionGadgetFinder)
++    return false;
++
++  // FIXME: support 32-bit
++  if (!STI->is64Bit())
++    return false;
++
++  TII = STI->getInstrInfo();
++  TRI = STI->getRegisterInfo();
++  JumpGadgetLoads.clear();
++  CallGadgetLoads.clear();
++  RetGadgetLoads.clear();
++  LLVM_DEBUG(dbgs() << "Building gadget graph...\n");
++  const auto &MLI = getAnalysis<MachineLoopInfo>();
++  const auto &MDT = getAnalysis<MachineDominatorTree>();
++  const auto &MDF = getAnalysis<MachineDominanceFrontier>();
++  std::unique_ptr<MachineGadgetGraph> Graph = getGadgetGraph(MF, MLI, MDT, MDF);
++  LLVM_DEBUG(dbgs() << "Building gadget graph... Done\n");
++  if (Graph == nullptr)
++    return false; // didn't find any gadgets
++
++  if (Graph->NumGadgets == 0)
++    return false;
++
++  if (EmitDot) {
++    LLVM_DEBUG(dbgs() << "Emitting gadget graph...\n");
++    std::error_code FileError;
++    std::string FileName = "bti.";
++    FileName += MF.getName();
++    FileName += ".dot";
++    raw_fd_ostream FileOut(FileName, FileError);
++    if (FileError)
++      errs() << FileError.message();
++    writeGadgetGraph(FileOut, MF, Graph.get());
++    FileOut.close();
++    LLVM_DEBUG(dbgs() << "Emitting gadget graph... Done\n");
++  }
++
++  return false;
++}
++
++// Returns the number of bits shifted if this is a SHL
++static int isSHL(const MachineInstr *MI) {
++  switch (MI->getOpcode()) {
++  case X86::SHL8ri:
++  case X86::SHL16ri:
++  case X86::SHL32ri:
++  case X86::SHL64ri:
++    return MI->getOperand(2).getImm();
++  }
++  return 0;
++}
++
++// Returns `true` if at least one of the Def's reaches a gadget
++bool X86BranchTargetInjectionGadgetFinderPass::analyzeDefs(
++    GraphBuilderContext &Ctx,
++    const SmallVector<rdf::NodeAddr<rdf::DefNode *>, 4> &Defs,
++    const Twine &Label, unsigned TargetType) {
++  using namespace rdf;
++  using GraphIter = typename GraphBuilder::BuilderNodeRef;
++  bool GadgetFound = false;
++  GraphBuilder &Builder = Ctx.Builder;
++  MachineFunction &MF = *Ctx.MF;
++  auto &NodeMap = Ctx.NodeMap;
++  auto &GadgetComponentSet = Ctx.GadgetComponentSet;
++  DataFlowGraph &DFG = *Ctx.DFG;
++  Liveness &L = *Ctx.L;
++  SmallSet<const MachineInstr *, 4> &GadgetLoads =
++      TargetType == Call
++          ? CallGadgetLoads
++          : (TargetType == Jump ? JumpGadgetLoads : RetGadgetLoads);
++
++  //  Returns `true` if a new node was added
++  auto MaybeAddNode = [&](MachineInstr *MI) -> std::pair<GraphIter, bool> {
++    auto Ref = NodeMap.find(MI);
++    if (Ref == NodeMap.end())
++      return {NodeMap[MI] = Builder.addVertex(MI), true};
++    return {Ref->getSecond(), false};
++  };
++
++  auto MaybeAddDefUseEdge = [&](NodeAddr<DefNode *> Def,
++                                NodeAddr<UseNode *> Use,
++                                MachineGadgetGraph::GadgetEdgeType EdgeType) {
++    MachineInstr *DefI = Def.Addr->getFlags() & NodeAttrs::PhiRef
++                             ? MachineGadgetGraph::ArgNodeSentinel
++                             : Def.Addr->getOp().getParent();
++    auto DefNode = MaybeAddNode(DefI);
++    NodeAddr<InstrNode *> UseOwner{Use.Addr->getOwner(DFG)};
++    auto *UseI = UseOwner.Addr->getCode<MachineInstr *>();
++    auto UseNode = MaybeAddNode(UseI);
++    if (GadgetComponentSet.insert({{DefNode.first, UseNode.first}, EdgeType})
++            .second) {
++      if (EmitSymbols) {
++        MCSymbol *Symbol = UseI->getPreInstrSymbol();
++        if (Symbol) {
++          // create a NOP
++          MachineInstr *NOP = BuildMI(*UseI->getParent(), UseI, DebugLoc(),
++                                      TII->get(X86::NOOP));
++          NOP->setPreInstrSymbol(MF, Symbol);
++        }
++        UseI->setPreInstrSymbol(
++            MF, MF.getContext().getOrCreateSymbol(
++                    Twine("__BTI__") +
++                    MachineGadgetGraph::GadgetEdgeString[EdgeType] + "_" +
++                    Label + "_" + Twine(NumLabels++)));
++      }
++      Builder.addEdge(-EdgeType - 1, DefNode.first, UseNode.first);
++      return true;
++    }
++    return false;
++  };
++
++  // The `Transmitters` set memoizes uses that reach a transmitter.
++  // The `LoadTransmitters` set memoizes uses that reach a load whose def
++  // reaches a transmitter.
++  DenseMap<NodeId, SmallSet<NodeId, 4>> Transmitters, ShlTransmitters,
++      LoadTransmitters, LoadShlTransmitters, &MemoryAccesses = Transmitters,
++                                             LoadMemoryAccesses;
++
++  // Traverse def-use chains rooted at `SourceDef` to find BTI gadgets
++  auto AnalyzeDef = [&](NodeAddr<DefNode *> SourceDef) {
++    SmallSet<NodeId, 8> UsesVisited, DefsVisited;
++    LLVM_DEBUG(dbgs() << "Analyzing live def: "
++                      << PrintNode<DefNode *>(SourceDef, DFG) << "\n");
++
++    std::function<void(NodeAddr<DefNode *>)> AnalyzeDefUseChain =
++        [&](NodeAddr<DefNode *> Def) {
++          if (Def.Addr->getRegRef(DFG).Reg == X86::EFLAGS)
++            return;
++          if (Def.Addr->getRegRef(DFG).Reg == X86::RSP)
++            // RDF will propagate PUSH <GPR> to RSP, which we don't care
++            // about
++            return;
++          // Use RDF to find all the uses of `Def`
++          rdf::NodeSet Uses;
++          RegisterRef DefReg = Def.Addr->getRegRef(DFG);
++          for (auto UseID : L.getAllReachedUses(DefReg, Def)) {
++            auto Use = DFG.addr<UseNode *>(UseID);
++            if (Use.Addr->getFlags() & NodeAttrs::PhiRef) { // phi node
++              NodeAddr<PhiNode *> Phi = Use.Addr->getOwner(DFG);
++              for (const auto &I : L.getRealUses(Phi.Id)) {
++                if (DFG.getPRI().alias(RegisterRef(I.first), DefReg)) {
++                  for (const auto &UA : I.second)
++                    Uses.emplace(UA.first);
++                }
++              }
++            } else { // not a phi node
++              Uses.emplace(UseID);
++            }
++          }
++
++          for (auto UseID : Uses) {
++            if (!UsesVisited.insert(UseID).second)
++              continue; // Already visited this use of `Def`
++
++            auto Use = DFG.addr<UseNode *>(UseID);
++            LLVM_DEBUG(dbgs() << "Traversing use: "
++                              << PrintNode<UseNode *>(Use, DFG) << "\n");
++            assert(!(Use.Addr->getFlags() & NodeAttrs::PhiRef));
++            MachineOperand &UseMO = Use.Addr->getOp();
++            assert(UseMO.isReg());
++            MachineInstr &UseMI = *UseMO.getParent();
++            unsigned UseOpcode = UseMI.getOpcode();
++            bool UseMayLoad = UseMI.mayLoad() &&
++                              instrUsesRegToAccessMemory(UseMI, UseMO.getReg());
++            bool UseMayMaskLoadByte =
++                UseOpcode == X86::MOVZX16rm8 || UseOpcode == X86::MOVZX32rm8 ||
++                UseOpcode == X86::MOVZX64rm8 || UseOpcode == X86::MOVSX16rm8 ||
++                UseOpcode == X86::MOVSX32rm8 || UseOpcode == X86::MOVSX64rm8;
++            bool UseMayMaskLoadWord = UseOpcode == X86::MOVZX16rm16 ||
++                                      UseOpcode == X86::MOVZX32rm16 ||
++                                      UseOpcode == X86::MOVZX64rm16 ||
++                                      UseOpcode == X86::MOVSX16rm16 ||
++                                      UseOpcode == X86::MOVSX32rm16 ||
++                                      UseOpcode == X86::MOVSX64rm16;
++            bool UseMayLoadAddress = false;
++            if (UseMayLoad && !UseMayMaskLoadByte && !UseMayMaskLoadWord &&
++                !UseMI.defs().empty()) {
++              for (const auto &MO : UseMI.defs()) {
++                if (MO.isReg() &&
++                    TRI->getRegSizeInBits(MO.getReg(), MF.getRegInfo()) == 64) {
++                  UseMayLoadAddress = true;
++                  break;
++                }
++              }
++            }
++            bool UseMayAddressMemory =
++                instrUsesRegToAccessMemory(UseMI, UseMO.getReg());
++            bool UseMayTransmit = UseMayAddressMemory;
++            bool UseMayShl = isSHL(&UseMI) >= 6;
++
++            if (UseMI.isCall())
++              continue;
++
++            if (UseMayTransmit)
++              Transmitters[Def.Id].insert(Use.Id);
++
++            //  Check whether the use propagates to more defs.
++            NodeAddr<InstrNode *> Owner{Use.Addr->getOwner(DFG)};
++            for (const auto &ChildDef :
++                 Owner.Addr->members_if(DataFlowGraph::IsDef, DFG)) {
++              if (Def.Addr->getAttrs() & NodeAttrs::Dead)
++                continue;
++              if (Def.Id == ChildDef.Id)
++                continue; // `Def` uses itself (e.g., increment loop counter)
++              if (DefsVisited.insert(ChildDef.Id).second)
++                AnalyzeDefUseChain(ChildDef);
++
++              LLVM_DEBUG(dbgs() << "Analyzing use: "
++                                << PrintNode<UseNode *>(Use, DFG) << "\n");
++
++              if (UseMayTransmit)
++                LLVM_DEBUG(dbgs() << "Use may transmit\n");
++
++              if (!Transmitters[ChildDef.Id].empty()) {
++                LLVM_DEBUG(dbgs() << "Use reaches a transmitter\n");
++                if (!UseMayTransmit)
++                  Transmitters[Def.Id].insert(Transmitters[ChildDef.Id].begin(),
++                                              Transmitters[ChildDef.Id].end());
++                if (GadgetType == AllGadgets) {
++                  if (UseMayLoad) {
++                    LLVM_DEBUG(dbgs() << "Use may load\n");
++                    LoadTransmitters[Def.Id].insert(Use.Id);
++                  }
++                  if (UseMayLoadAddress) {
++                    LLVM_DEBUG(dbgs() << "Use may load address\n");
++                    LoadMemoryAccesses[Def.Id].insert(Use.Id);
++                  }
++                } else { // High quality gadgets only
++                  if (UseMayShl) {
++                    LLVM_DEBUG(dbgs()
++                               << "Use may shift left by 6 or more bits\n");
++                    ShlTransmitters[Def.Id].insert(Use.Id);
++                  }
++                  if (UseMayMaskLoadWord) {
++                    LLVM_DEBUG(dbgs() << "Use may mask-load word\n");
++                    LoadTransmitters[Def.Id].insert(Use.Id);
++                  }
++                  if (UseMayLoadAddress) {
++                    LLVM_DEBUG(dbgs() << "Use may load address\n");
++                    LoadMemoryAccesses[Def.Id].insert(Use.Id);
++                  }
++                }
++              }
++              if (GadgetType != AllGadgets &&
++                  !ShlTransmitters[ChildDef.Id].empty()) {
++                if (UseMayMaskLoadByte) {
++                  LLVM_DEBUG(
++                      dbgs()
++                      << "Use may mask-load byte and propagate to a SHL\n");
++                  LoadShlTransmitters[Def.Id].insert(Use.Id);
++                } else if (!UseMayLoad) {
++                  LLVM_DEBUG(dbgs() << "Use may load and propagate to a SHL\n");
++                  ShlTransmitters[Def.Id].insert(
++                      ShlTransmitters[ChildDef.Id].begin(),
++                      ShlTransmitters[ChildDef.Id].end());
++                }
++              }
++              if (!LoadTransmitters[ChildDef.Id].empty()) {
++                LLVM_DEBUG(dbgs() << "Use propagates to a load transmitter\n");
++                LoadTransmitters[Def.Id].insert(
++                    LoadTransmitters[ChildDef.Id].begin(),
++                    LoadTransmitters[ChildDef.Id].end());
++              }
++              if (GadgetType != AllGadgets &&
++                  !LoadShlTransmitters[ChildDef.Id].empty()) {
++                LLVM_DEBUG(dbgs()
++                           << "Use propagates to a load SHL transmitter\n");
++                LoadShlTransmitters[Def.Id].insert(
++                    LoadShlTransmitters[ChildDef.Id].begin(),
++                    LoadShlTransmitters[ChildDef.Id].end());
++              }
++              if (!LoadMemoryAccesses[ChildDef.Id].empty()) {
++                LLVM_DEBUG(dbgs()
++                           << "Use propagates to a load memory access\n");
++                LoadMemoryAccesses[Def.Id].insert(
++                    LoadMemoryAccesses[ChildDef.Id].begin(),
++                    LoadMemoryAccesses[ChildDef.Id].end());
++              }
++            }
++            UsesVisited.erase(UseID);
++          }
++        };
++
++    // Memoize all potential gadget components that are reachable from this def
++    AnalyzeDefUseChain(SourceDef);
++  };
++
++  // 1. Scan all live defs and memoize loads, shifts, transmitters, etc.
++  llvm::for_each(Defs, AnalyzeDef);
++
++  // Set of uses that access memory and are attacker-controlled
++  SmallSet<NodeId, 4> AccessesInfluencedByLiveReg;
++  // Map from uses that access memory to the closest attacker-controlled
++  // load def
++  DenseMap<NodeId, SmallSet<NodeId, 4>> AccessesInfluencedByLoadFromLiveReg;
++
++  for (auto Def : Defs) {
++    AccessesInfluencedByLiveReg.insert(MemoryAccesses[Def.Id].begin(),
++                                       MemoryAccesses[Def.Id].end());
++    for (auto LoadUseId : LoadMemoryAccesses[Def.Id]) {
++      auto LoadUse = DFG.addr<UseNode *>(LoadUseId);
++      NodeAddr<InstrNode *> LoadOwner{LoadUse.Addr->getOwner(DFG)};
++      for (const auto &LoadDef :
++           LoadOwner.Addr->members_if(DataFlowGraph::IsDef, DFG))
++        for (auto MemoryAccessId : MemoryAccesses[LoadDef.Id])
++          AccessesInfluencedByLoadFromLiveReg[MemoryAccessId].insert(
++              LoadUse.Addr->getReachingDef());
++    }
++  }
++
++  auto GadgetMayBeAttackerControlled = [&](NodeId GadgetLoadDefId,
++                                           NodeId GadgetTransmitUseId) {
++    auto TransmitUse = DFG.addr<UseNode *>(GadgetTransmitUseId);
++    NodeAddr<StmtNode *> TransmitOwner{TransmitUse.Addr->getOwner(DFG)};
++    MachineInstr *TransmitMI = TransmitOwner.Addr->getCode();
++    LLVM_DEBUG(
++        dbgs() << "Considering whether a gadget is attacker controlled\n");
++    const MCInstrDesc &Desc = TransmitMI->getDesc();
++    int MemRefBeginIdx = X86II::getMemoryOperandNo(Desc.TSFlags);
++    if (MemRefBeginIdx < 0) {
++      LLVM_DEBUG(
++          dbgs() << "Warning: unable to obtain memory operand for loading "
++                    "instruction:\n";
++          TransmitMI->print(dbgs()); dbgs() << '\n';);
++      return false;
++    }
++    MemRefBeginIdx += X86II::getOperandBias(Desc);
++    const MachineOperand *BaseMO =
++        &TransmitMI->getOperand(MemRefBeginIdx + X86::AddrBaseReg);
++    const MachineOperand *IndexMO =
++        &TransmitMI->getOperand(MemRefBeginIdx + X86::AddrIndexReg);
++    if (IndexMO->getReg() == X86::NoRegister) {
++      LLVM_DEBUG(dbgs() << "Access is influenced by a loaded secret\n");
++      return true; // The transmitted value is the base register
++    }
++    // Otherwise, there are two register operands. One is the transmitted
++    // value and the other is the base
++    const MachineOperand *TransmitMO = &TransmitUse.Addr->getOp();
++    const MachineOperand *OtherMO = TransmitMO == IndexMO ? BaseMO : IndexMO;
++    for (const auto &Use :
++         TransmitOwner.Addr->members_if(DataFlowGraph::IsUse, DFG)) {
++      auto U = DFG.addr<UseNode *>(Use.Id);
++      if (&U.Addr->getOp() == OtherMO) {
++        if (AccessesInfluencedByLiveReg.contains(Use.Id)) {
++          LLVM_DEBUG(dbgs()
++                     << "Access is influenced by a live attacker-controlled "
++                        "register\n");
++          return true;
++        }
++        for (NodeId LoadId : AccessesInfluencedByLoadFromLiveReg[Use.Id])
++          if (LoadId == GadgetLoadDefId)
++            return false;
++      }
++    }
++    LLVM_DEBUG(dbgs() << "Access may be attacker controlled\n");
++    return true;
++  };
++
++  // 3. Find attacker-influenced load+transmit pairs that also have attacker-
++  // controlled/knowable base addresses.
++  for (auto Def : Defs) {
++    for (auto LoadUseId : LoadTransmitters[Def.Id]) {
++      auto LoadUse = DFG.addr<UseNode *>(LoadUseId);
++      NodeAddr<StmtNode *> LoadOwner{LoadUse.Addr->getOwner(DFG)};
++      for (const auto &LoadDef :
++           LoadOwner.Addr->members_if(DataFlowGraph::IsDef, DFG)) {
++        for (auto TransmitId : Transmitters[LoadDef.Id]) {
++          auto Transmit = DFG.addr<UseNode *>(TransmitId);
++          if (GadgetMayBeAttackerControlled(LoadUse.Addr->getReachingDef(),
++                                            TransmitId)) {
++            if (GadgetType != LinearGadgets ||
++                gadgetIsLinear(DFG, {Def.Addr->getOwner(DFG), LoadOwner,
++                                     Transmit.Addr->getOwner(DFG)})) {
++              GadgetFound = true;
++              GadgetLoads.insert(LoadOwner.Addr->getCode());
++              MaybeAddDefUseEdge(Def, LoadUse,
++                                 MachineGadgetGraph::GadgetEdgeType::WordLoad);
++              MaybeAddDefUseEdge(LoadDef, Transmit,
++                                 MachineGadgetGraph::GadgetEdgeType::Transmit);
++            }
++          }
++        }
++      }
++    }
++    if (GadgetType != AllGadgets) {
++      for (auto LoadUseId : LoadShlTransmitters[Def.Id]) {
++        auto LoadUse = DFG.addr<UseNode *>(LoadUseId);
++        NodeAddr<StmtNode *> LoadOwner{LoadUse.Addr->getOwner(DFG)};
++        for (const auto &LoadDef :
++             LoadOwner.Addr->members_if(DataFlowGraph::IsDef, DFG)) {
++          for (auto ShlId : ShlTransmitters[LoadDef.Id]) {
++            auto Shl = DFG.addr<UseNode *>(ShlId);
++            NodeAddr<InstrNode *> ShlOwner{Shl.Addr->getOwner(DFG)};
++            for (const auto &ShlDef :
++                 ShlOwner.Addr->members_if(DataFlowGraph::IsDef, DFG)) {
++              for (auto TransmitId : Transmitters[ShlDef.Id]) {
++                auto Transmit = DFG.addr<UseNode *>(TransmitId);
++                if (GadgetMayBeAttackerControlled(
++                        LoadUse.Addr->getReachingDef(), TransmitId)) {
++                  if (GadgetType != LinearGadgets ||
++                      gadgetIsLinear(DFG, {Def.Addr->getOwner(DFG), LoadOwner,
++                                           ShlOwner,
++                                           Transmit.Addr->getOwner(DFG)})) {
++                    GadgetFound = true;
++                    GadgetLoads.insert(LoadOwner.Addr->getCode());
++                    MaybeAddDefUseEdge(
++                        Def, LoadUse,
++                        MachineGadgetGraph::GadgetEdgeType::ByteLoad);
++                    MaybeAddDefUseEdge(LoadDef, Shl,
++                                       MachineGadgetGraph::GadgetEdgeType::Shl);
++                    MaybeAddDefUseEdge(
++                        ShlDef, Transmit,
++                        MachineGadgetGraph::GadgetEdgeType::Transmit);
++                  }
++                }
++              }
++            }
++          }
++        }
++      }
++    }
++  }
++
++  return GadgetFound;
++}
++
++bool X86BranchTargetInjectionGadgetFinderPass::gadgetIsLinear(
++    const rdf::DataFlowGraph &DFG,
++    const SmallVector<rdf::NodeAddr<rdf::InstrNode *>, 4> &GadgetComponents)
++    const {
++  using namespace rdf;
++  LLVM_DEBUG(dbgs() << "Considering whether a gadget is linear\n");
++  int NumGadgetComponents = GadgetComponents.size(),
++      NumGadgetComponentsInBlock = 0;
++  assert(NumGadgetComponents > 1);
++  NodeAddr<InstrNode *> IA = GadgetComponents[0];
++  NodeAddr<BlockNode *> BA = IA.Addr->getOwner(DFG);
++  while (true) {
++    while (true) {
++      NumGadgetComponentsInBlock +=
++          IA == GadgetComponents[NumGadgetComponentsInBlock];
++      if (NumGadgetComponentsInBlock == NumGadgetComponents) {
++        return true;
++      }
++      if (IA.Addr->getKind() == NodeAttrs::Stmt) {
++        NodeAddr<StmtNode *> SA = IA;
++        if (SA.Addr->getCode()->isCall()) {
++          LLVM_DEBUG(dbgs()
++                     << "Gadget passes through a call and is not linear\n");
++          return false;
++        }
++        if (SA.Addr->getCode()->getDesc().isTrap()) {
++          LLVM_DEBUG(dbgs()
++                     << "Gadget passes through a trap and is not linear\n");
++          return false;
++        }
++      }
++      auto N = DFG.addr<NodeBase *>(IA.Addr->getNext());
++      if (N.Id == 0 || N.Addr == BA.Addr)
++        break;
++      IA = N;
++    }
++    if (BA.Addr->getCode()->succ_size() != 1)
++      break;
++    BA = DFG.findBlock(*BA.Addr->getCode()->succ_begin());
++    IA = BA.Addr->getFirstMember(DFG);
++  }
++  return false;
++}
++
++std::unique_ptr<MachineGadgetGraph>
++X86BranchTargetInjectionGadgetFinderPass::getGadgetGraph(
++    MachineFunction &MF, const MachineLoopInfo &MLI,
++    const MachineDominatorTree &MDT, const MachineDominanceFrontier &MDF) {
++  using namespace rdf;
++  using GraphIter = typename GraphBuilder::BuilderNodeRef;
++  int FenceCount = 0;
++
++  DenseMap<MachineInstr *, SmallSet<MachineInstr *, 6>> ReturnTargetDefs;
++  DenseMap<MachineBasicBlock *, SmallSet<MachineInstr *, 8>>
++      IndirectJumpTargetDefs;
++
++  SmallSet<MachineBasicBlock *, 8> IndirectJumpMBBsToScan;
++  auto *JumpTableInfo = MF.getJumpTableInfo();
++  if (JumpTableInfo)
++    for (auto &JumpTable : MF.getJumpTableInfo()->getJumpTables())
++      for (MachineBasicBlock *MBB : JumpTable.MBBs)
++        if (!MBB->livein_empty())
++          IndirectJumpMBBsToScan.insert(MBB);
++
++  for (MachineBasicBlock &MBB : MF)
++    if (MBB.hasAddressTaken() && !MBB.livein_empty())
++      IndirectJumpMBBsToScan.insert(&MBB);
++
++  for (MachineBasicBlock *MBB : IndirectJumpMBBsToScan) {
++    auto &IndirectJumpTargetDefsForBlock = IndirectJumpTargetDefs[MBB];
++    for (auto Reg : MBB->liveins())
++      // FIXME: May want to include lane masks in the analysis
++      IndirectJumpTargetDefsForBlock.insert(
++          BuildMI(*MBB, MBB->begin(), DebugLoc(), TII->get(TargetOpcode::COPY),
++                  Reg.PhysReg)
++              .addReg(Reg.PhysReg));
++  }
++
++  for (auto &MBB : MF) {
++    for (auto &MI : MBB) {
++      if (!MI.isCall() || MI.isPseudo())
++        continue;
++
++      auto &ReturnTargetDefsForCall = ReturnTargetDefs[&MI];
++      for (auto Reg :
++           {X86::RBX, X86::RBP, X86::R12, X86::R13, X86::R14, X86::R15})
++        ReturnTargetDefsForCall.insert(
++            BuildMI(MBB, MI.getNextNode() ? MI.getNextNode() : MBB.end(),
++                    DebugLoc(), TII->get(TargetOpcode::COPY), Reg)
++                .addReg(Reg));
++    }
++  }
++
++  // Build the Register Dataflow Graph using the RDF framework
++  TargetOperandInfo TOI{*TII};
++  DataFlowGraph DFG{MF, *TII, *TRI, MDT, MDF, TOI};
++  DFG.build();
++  Liveness L{MF.getRegInfo(), DFG};
++  L.computePhiInfo();
++  GraphBuilderContext Ctx;
++  Ctx.MF = &MF;
++  Ctx.DFG = &DFG;
++  Ctx.L = &L;
++  GraphBuilder &Builder = Ctx.Builder;
++  auto &NodeMap = Ctx.NodeMap;
++
++  if (BranchTargetType & Ret) {
++    SmallVector<NodeAddr<DefNode *>, 4> LiveDefs;
++    NodeList Blocks = DFG.getFunc().Addr->members(DFG);
++    for (auto BI = Blocks.rbegin(), BE = Blocks.rend(); BI != BE; ++BI) {
++      NodeAddr<BlockNode *> BA = *BI;
++      NodeList Instrs =
++          BA.Addr->members_if(DataFlowGraph::IsCode<NodeAttrs::Stmt>, DFG);
++      for (auto SI = Instrs.rbegin(), SE = Instrs.rend(); SI != SE; ++SI) {
++        NodeAddr<StmtNode *> SA = *SI;
++        MachineInstr *MI = SA.Addr->getCode();
++        if (!MI->isCall() || MI->isPseudo())
++          continue;
++
++        const MachineOperand &CalleeOperand = TII->getCalleeOperand(*MI);
++        std::string CalleeOperandStr;
++        llvm::raw_string_ostream CalleeOperandStrStream(CalleeOperandStr);
++        CalleeOperand.print(CalleeOperandStrStream, TRI,
++                            MF.getTarget().getIntrinsicInfo());
++
++        ++NumReturnTargetsAnalyzed;
++        LiveDefs.clear();
++        auto &ReturnTargetDefsForCall = ReturnTargetDefs[MI];
++        for (auto I = DFG.addr<StmtNode *>(SA.Addr->getNext());
++             I.Id != 0 && ReturnTargetDefsForCall.contains(I.Addr->getCode());
++             I = DFG.addr<StmtNode *>(I.Addr->getNext()))
++          for (auto D : I.Addr->members_if(DataFlowGraph::IsDef, DFG))
++            LiveDefs.push_back(D);
++        NumReturnTargetsWithGadgets +=
++            analyzeDefs(Ctx, LiveDefs, "Return_" + CalleeOperandStr, Ret);
++      }
++    }
++  }
++
++  if (BranchTargetType & Jump) {
++    SmallVector<NodeAddr<DefNode *>, 4> LiveDefs;
++    auto AnalyzeBlock = [&](NodeAddr<BlockNode *> BA) {
++      ++NumIndirectJumpTargetsAnalyzed;
++      LiveDefs.clear();
++      auto &IndirectJumpTargetDefsForBlock =
++          IndirectJumpTargetDefs[BA.Addr->getCode()];
++      NodeList Instrs =
++          BA.Addr->members_if(DataFlowGraph::IsCode<NodeAttrs::Stmt>, DFG);
++      for (NodeAddr<StmtNode *> I = *Instrs.begin();
++           I.Id != 0 &&
++           IndirectJumpTargetDefsForBlock.contains(I.Addr->getCode());
++           I = DFG.addr<StmtNode *>(I.Addr->getNext()))
++        for (auto D : I.Addr->members_if(DataFlowGraph::IsDef, DFG))
++          LiveDefs.push_back(D);
++
++      return analyzeDefs(Ctx, LiveDefs, "Jump", Jump);
++    };
++
++    for (MachineBasicBlock *MBB : IndirectJumpMBBsToScan) {
++      assert(!MBB->empty());
++      if (AnalyzeBlock(DFG.findBlock(MBB))) {
++        ++NumIndirectJumpTargetsWithGadgets;
++        if (!MBB->begin()->getPreInstrSymbol())
++          MBB->begin()->setPreInstrSymbol(
++              MF,
++              MF.getContext().getOrCreateSymbol(
++                  Twine("__BTI__") + "BasicBlockBegin_" + Twine(NumLabels++)));
++      }
++    }
++  }
++
++  if (BranchTargetType & Call) {
++    SmallVector<NodeAddr<DefNode *>, 4> LiveDefs;
++    bool FunctionCanBeIndirectCallTarget = true;
++    const User *FU = nullptr;
++    if (!MF.getFunction().hasAddressTaken(&FU, false, true, true))
++      FunctionCanBeIndirectCallTarget = false;
++    else if (FU->hasOneUser()) {
++      const User *FunctionUser = *FU->user_begin();
++      if (FunctionUser->hasName() &&
++          FunctionUser->getName().startswith("__UNIQUE_ID__"))
++        FunctionCanBeIndirectCallTarget = false;
++    }
++
++    if (FunctionCanBeIndirectCallTarget) {
++      ++NumIndirectCallTargetsAnalyzed;
++      // Analyze function arguments
++      LLVM_DEBUG(dbgs() << "Analyzing def-use chains to find gadgets\n");
++      NodeAddr<BlockNode *> EntryBlock = DFG.getFunc().Addr->getEntryBlock(DFG);
++      for (NodeAddr<PhiNode *> ArgPhi :
++           EntryBlock.Addr->members_if(DataFlowGraph::IsPhi, DFG))
++        for (auto D : ArgPhi.Addr->members_if(DataFlowGraph::IsDef, DFG))
++          LiveDefs.push_back(D);
++
++      if (analyzeDefs(Ctx, LiveDefs, "Call", Call))
++        ++NumIndirectCallTargetsWithGadgets;
++    }
++  }
++
++  // Returns `true` if a new node was added
++  auto MaybeAddNode = [&](MachineInstr *MI) -> std::pair<GraphIter, bool> {
++    auto Ref = NodeMap.find(MI);
++    if (Ref == NodeMap.end())
++      return {NodeMap[MI] = Builder.addVertex(MI), true};
++    return {Ref->getSecond(), false};
++  };
++
++  // Analyze every instruction in MF
++  //
++  // FIXME: One enhancement would be to prune gadget edges that cross fences
++  // along all control-flow paths, as the LVI pass does.
++  for (NodeAddr<BlockNode *> BA : DFG.getFunc().Addr->members(DFG)) {
++    for (NodeAddr<StmtNode *> SA :
++         BA.Addr->members_if(DataFlowGraph::IsCode<NodeAttrs::Stmt>, DFG)) {
++      MachineInstr *MI = SA.Addr->getCode();
++      if (isFence(MI)) {
++        MaybeAddNode(MI);
++        ++FenceCount;
++      }
++    }
++  }
++  int NumGadgetsFound =
++      CallGadgetLoads.size() + JumpGadgetLoads.size() + RetGadgetLoads.size();
++  LLVM_DEBUG(dbgs() << "Found " << NumGadgetsFound << " gadgets\n");
++  if (NumGadgetsFound == 0)
++    return nullptr;
++  NumIndirectCallTargetGadgets += CallGadgetLoads.size();
++  NumIndirectJumpTargetGadgets += JumpGadgetLoads.size();
++  NumReturnTargetGadgets += RetGadgetLoads.size();
++
++  // Traverse CFG to build the rest of the graph
++  // FIXME: Look for fences
++  SmallSet<MachineBasicBlock *, 8> BlocksVisited;
++  std::function<void(MachineBasicBlock *, GraphIter, unsigned)> TraverseCFG =
++      [&](MachineBasicBlock *MBB, GraphIter GI, unsigned ParentDepth) {
++        unsigned LoopDepth = MLI.getLoopDepth(MBB);
++        if (!MBB->empty()) {
++          // Always add the first instruction in each block
++          auto NI = MBB->begin();
++          auto BeginBB = MaybeAddNode(&*NI);
++          Builder.addEdge(ParentDepth, GI, BeginBB.first);
++          if (!BlocksVisited.insert(MBB).second)
++            return;
++
++          // Add any instructions within the block that are gadget components
++          GI = BeginBB.first;
++          while (++NI != MBB->end()) {
++            auto Ref = NodeMap.find(&*NI);
++            if (Ref != NodeMap.end()) {
++              Builder.addEdge(LoopDepth, GI, Ref->getSecond());
++              GI = Ref->getSecond();
++            }
++          }
++
++          // Always add the terminator instruction, if one exists
++          auto T = MBB->getFirstTerminator();
++          if (T != MBB->end()) {
++            auto EndBB = MaybeAddNode(&*T);
++            if (EndBB.second)
++              Builder.addEdge(LoopDepth, GI, EndBB.first);
++            GI = EndBB.first;
++          }
++        }
++        for (MachineBasicBlock *Succ : MBB->successors())
++          TraverseCFG(Succ, GI, LoopDepth);
++      };
++  // ArgNodeSentinel is a pseudo-instruction that represents MF args in the
++  // GadgetGraph
++  GraphIter ArgNode = MaybeAddNode(MachineGadgetGraph::ArgNodeSentinel).first;
++  TraverseCFG(&MF.front(), ArgNode, 0);
++  std::unique_ptr<MachineGadgetGraph> G{
++      Builder.get(FenceCount, NumGadgetsFound)};
++  LLVM_DEBUG(dbgs() << "Found " << G->nodes_size() << " nodes\n");
++  LLVM_DEBUG(dbgs() << "Found " << FenceCount << " fences\n");
++  return G;
++}
++
++bool X86BranchTargetInjectionGadgetFinderPass::instrUsesRegToAccessMemory(
++    const MachineInstr &MI, unsigned Reg) const {
++  if (!MI.mayLoadOrStore() || MI.getOpcode() == X86::MFENCE ||
++      MI.getOpcode() == X86::SFENCE || MI.getOpcode() == X86::LFENCE)
++    return false;
++
++  // FIXME: This does not handle pseudo loading instruction like TCRETURN*
++  const MCInstrDesc &Desc = MI.getDesc();
++  int MemRefBeginIdx = X86II::getMemoryOperandNo(Desc.TSFlags);
++  if (MemRefBeginIdx < 0) {
++    LLVM_DEBUG(dbgs() << "Warning: unable to obtain memory operand for loading "
++                         "instruction:\n";
++               MI.print(dbgs()); dbgs() << '\n';);
++    return false;
++  }
++  MemRefBeginIdx += X86II::getOperandBias(Desc);
++
++  const MachineOperand &BaseMO =
++      MI.getOperand(MemRefBeginIdx + X86::AddrBaseReg);
++  const MachineOperand &IndexMO =
++      MI.getOperand(MemRefBeginIdx + X86::AddrIndexReg);
++  return (BaseMO.isReg() && BaseMO.getReg() != X86::NoRegister &&
++          TRI->regsOverlap(BaseMO.getReg(), Reg)) ||
++         (IndexMO.isReg() && IndexMO.getReg() != X86::NoRegister &&
++          TRI->regsOverlap(IndexMO.getReg(), Reg));
++}
++
++INITIALIZE_PASS_BEGIN(X86BranchTargetInjectionGadgetFinderPass, PASS_KEY,
++                      "X86 BTI gadget finder", false, false)
++INITIALIZE_PASS_DEPENDENCY(MachineLoopInfo)
++INITIALIZE_PASS_DEPENDENCY(MachineDominatorTree)
++INITIALIZE_PASS_DEPENDENCY(MachineDominanceFrontier)
++INITIALIZE_PASS_END(X86BranchTargetInjectionGadgetFinderPass, PASS_KEY,
++                    "X86 BTI gadget finder", false, false)
++
++FunctionPass *llvm::createX86BranchTargetInjectionGadgetFinderPass() {
++  return new X86BranchTargetInjectionGadgetFinderPass();
++}
+diff --git a/llvm/lib/Target/X86/X86LoadValueInjectionLoadHardening.cpp b/llvm/lib/Target/X86/X86LoadValueInjectionLoadHardening.cpp
+index 165533eba346..d23d27f94fe3 100644
+--- a/llvm/lib/Target/X86/X86LoadValueInjectionLoadHardening.cpp
++++ b/llvm/lib/Target/X86/X86LoadValueInjectionLoadHardening.cpp
+@@ -335,10 +335,12 @@ X86LoadValueInjectionLoadHardeningPass::getGadgetGraph(
+   DFG.build();
+   Liveness L{MF.getRegInfo(), DFG};
+   L.computePhiInfo();
++  // outs() << PrintNode<FuncNode *>(DFG.getFunc(), DFG);
+ 
+   GraphBuilder Builder;
+   using GraphIter = typename GraphBuilder::BuilderNodeRef;
+   DenseMap<MachineInstr *, GraphIter> NodeMap;
++  DenseSet<std::pair<GraphIter, GraphIter>> GadgetSet;
+   int FenceCount = 0, GadgetCount = 0;
+   auto MaybeAddNode = [&NodeMap, &Builder](MachineInstr *MI) {
+     auto Ref = NodeMap.find(MI);
+@@ -349,6 +351,16 @@ X86LoadValueInjectionLoadHardeningPass::getGadgetGraph(
+     }
+     return std::pair<GraphIter, bool>{Ref->getSecond(), false};
+   };
++  auto MaybeAddGadgetEdge = [&GadgetSet, &Builder,
++                             &GadgetCount](GraphIter Source, GraphIter Sink) {
++    auto Ref = GadgetSet.insert({Source, Sink});
++    if (Ref.second) {
++      Builder.addEdge(MachineGadgetGraph::GadgetEdgeSentinel, Source, Sink);
++      ++GadgetCount;
++      return true;
++    }
++    return false;
++  };
+ 
+   // The `Transmitters` map memoizes transmitters found for each def. If a def
+   // has not yet been analyzed, then it will not appear in the map. If a def
+@@ -372,7 +384,7 @@ X86LoadValueInjectionLoadHardeningPass::getGadgetGraph(
+             auto Use = DFG.addr<UseNode *>(UseID);
+             if (Use.Addr->getFlags() & NodeAttrs::PhiRef) { // phi node
+               NodeAddr<PhiNode *> Phi = Use.Addr->getOwner(DFG);
+-              for (const auto& I : L.getRealUses(Phi.Id)) {
++              for (const auto &I : L.getRealUses(Phi.Id)) {
+                 if (DFG.getPRI().alias(RegisterRef(I.first), DefReg)) {
+                   for (const auto &UA : I.second)
+                     Uses.emplace(UA.first);
+@@ -460,9 +472,7 @@ X86LoadValueInjectionLoadHardeningPass::getGadgetGraph(
+       MachineInstr *Sink = DFG.addr<StmtNode *>(TransmitterId).Addr->getCode();
+       auto GadgetSink = MaybeAddNode(Sink);
+       // Add the gadget edge to the graph.
+-      Builder.addEdge(MachineGadgetGraph::GadgetEdgeSentinel,
+-                      GadgetSource.first, GadgetSink.first);
+-      ++GadgetCount;
++      MaybeAddGadgetEdge(GadgetSource.first, GadgetSink.first);
+     }
+   };
+ 
+diff --git a/llvm/lib/Target/X86/X86TargetMachine.cpp b/llvm/lib/Target/X86/X86TargetMachine.cpp
+index ee8cff3e008b..6a02a37bbf8c 100644
+--- a/llvm/lib/Target/X86/X86TargetMachine.cpp
++++ b/llvm/lib/Target/X86/X86TargetMachine.cpp
+@@ -71,6 +71,7 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeX86Target() {
+   initializeEvexToVexInstPassPass(PR);
+   initializeFixupLEAPassPass(PR);
+   initializeFPSPass(PR);
++  initializeX86BranchTargetInjectionGadgetFinderPassPass(PR);
+   initializeX86FixupSetCCPassPass(PR);
+   initializeX86CallFrameOptimizationPass(PR);
+   initializeX86CmovConverterPassPass(PR);
+@@ -564,6 +565,7 @@ void X86PassConfig::addPreEmitPass2() {
+   // hand inspection of the codegen output.
+   addPass(createX86SpeculativeExecutionSideEffectSuppression());
+   addPass(createX86IndirectThunksPass());
++  addPass(createX86BranchTargetInjectionGadgetFinderPass());
+ 
+   // Insert extra int3 instructions after trailing call instructions to avoid
+   // issues in the unwinder.
+diff --git a/llvm/test/CodeGen/X86/O0-pipeline.ll b/llvm/test/CodeGen/X86/O0-pipeline.ll
+index bf3ae6166075..d96cc23b78f3 100644
+--- a/llvm/test/CodeGen/X86/O0-pipeline.ll
++++ b/llvm/test/CodeGen/X86/O0-pipeline.ll
+@@ -71,6 +71,10 @@
+ ; CHECK-NEXT:       Live DEBUG_VALUE analysis
+ ; CHECK-NEXT:       X86 Speculative Execution Side Effect Suppression
+ ; CHECK-NEXT:       X86 Indirect Thunks
++; CHECK-NEXT:       MachineDominator Tree Construction
++; CHECK-NEXT:       Machine Natural Loop Construction
++; CHECK-NEXT:       Machine Dominance Frontier Construction
++; CHECK-NEXT:       X86 Branch Target Injection (BTI) gadget finding
+ ; CHECK-NEXT:       Check CFA info and insert CFI instructions if needed
+ ; CHECK-NEXT:       X86 Load Value Injection (LVI) Ret-Hardening
+ ; CHECK-NEXT:       Lazy Machine Block Frequency Analysis
+diff --git a/llvm/test/CodeGen/X86/opt-pipeline.ll b/llvm/test/CodeGen/X86/opt-pipeline.ll
+index c809433a2fff..df72dc38714f 100644
+--- a/llvm/test/CodeGen/X86/opt-pipeline.ll
++++ b/llvm/test/CodeGen/X86/opt-pipeline.ll
+@@ -198,6 +198,10 @@
+ ; CHECK-NEXT:       Live DEBUG_VALUE analysis
+ ; CHECK-NEXT:       X86 Speculative Execution Side Effect Suppression
+ ; CHECK-NEXT:       X86 Indirect Thunks
++; CHECK-NEXT:       MachineDominator Tree Construction
++; CHECK-NEXT:       Machine Natural Loop Construction
++; CHECK-NEXT:       Machine Dominance Frontier Construction
++; CHECK-NEXT:       X86 Branch Target Injection (BTI) gadget finding
+ ; CHECK-NEXT:       Check CFA info and insert CFI instructions if needed
+ ; CHECK-NEXT:       X86 Load Value Injection (LVI) Ret-Hardening
+ ; CHECK-NEXT:       Lazy Machine Block Frequency Analysis
